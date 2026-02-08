@@ -7,6 +7,7 @@ import com.ticket.service.StationService;
 import com.ticket.service.TicketQueryService;
 import com.ticket.service.TrainRouteService;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Scanner;
 
@@ -158,30 +159,51 @@ public class App {
         }
 
         System.out.println("  共找到 " + directTrains.size() + " 个车次");
-        System.out.println();
 
-        // 先打印所有车次的余票概况
-        printTableHeader();
-        int noTicketCount = 0;
-        int hasTicketCount = 0;
-        int canExtendCount = 0;
+        // 分类统计
+        List<TrainInfo> hasTicketTrains = new ArrayList<>();
+        List<TrainInfo> noTicketCanExtend = new ArrayList<>();
+        int noTicketTerminal = 0;
 
         for (TrainInfo train : directTrains) {
-            printTrainRow(train);
             if (train.hasAvailableTicket()) {
-                hasTicketCount++;
+                hasTicketTrains.add(train);
+            } else if (!train.getToStationCode().equals(train.getEndStationCode())) {
+                noTicketCanExtend.add(train);
             } else {
-                noTicketCount++;
-                // 判断该车次是否有延伸空间（到达站编码 != 终到站编码）
-                if (!train.getToStationCode().equals(train.getEndStationCode())) {
-                    canExtendCount++;
-                }
+                noTicketTerminal++;
+            }
+        }
+
+        // ===== 有票车次单独列出 =====
+        System.out.println();
+        if (!hasTicketTrains.isEmpty()) {
+            System.out.println("==================== 有票车次 (" + hasTicketTrains.size() + " 个) ====================");
+            printTableHeader();
+            for (TrainInfo train : hasTicketTrains) {
+                printTrainRow(train);
+            }
+        } else {
+            System.out.println("==================== 无直达有票车次 ====================");
+        }
+
+        // ===== 无票车次概况 =====
+        System.out.println();
+        int noTicketCount = noTicketCanExtend.size() + noTicketTerminal;
+        System.out.println("==================== 无票车次 (" + noTicketCount + " 个) ====================");
+        printTableHeader();
+        for (TrainInfo train : directTrains) {
+            if (!train.hasAvailableTicket()) {
+                printTrainRow(train);
             }
         }
 
         System.out.println();
-        System.out.println("直达有票: " + hasTicketCount + " | 直达无票: " + noTicketCount
-                + " | 可尝试买长: " + canExtendCount);
+        System.out.println("直达有票: " + hasTicketTrains.size() + " | 直达无票: " + noTicketCount
+                + " | 可尝试买长: " + noTicketCanExtend.size());
+
+        int hasTicketCount = hasTicketTrains.size();
+        int canExtendCount = noTicketCanExtend.size();
 
         if (canExtendCount == 0) {
             System.out.println("所有无票车次均以目的地为终到站，无法使用买长乘短策略。");
@@ -194,11 +216,11 @@ public class App {
         System.out.println("【第2步】分析买长乘短机会（共 " + canExtendCount + " 个车次需要查询）...");
         System.out.println();
 
-        int buyLongOpportunities = 0;
+        // 收集买长乘短机会
+        List<BuyLongResult> buyLongResults = new ArrayList<>();
         int analyzed = 0;
 
         for (TrainInfo train : directTrains) {
-            // 只分析无票且有延伸空间的车次
             if (train.hasAvailableTicket()) continue;
             if (train.getToStationCode().equals(train.getEndStationCode())) continue;
 
@@ -209,7 +231,6 @@ public class App {
                     + ", 终到: " + train.getEndStationName() + ")");
 
             try {
-                // 关键修复：用车次的实际始发站→终到站查完整路线
                 List<TrainStop> route = trainRouteService.queryRoute(
                         train.getTrainNo(),
                         train.getStartStationCode(),
@@ -221,7 +242,6 @@ public class App {
                     continue;
                 }
 
-                // 用到达站编码在完整路线中定位，找到之后的站点
                 List<TrainStop> stopsAfter = trainRouteService.getStopsAfter(
                         route, toStation.getName(), train.getToStationCode());
 
@@ -232,14 +252,19 @@ public class App {
 
                 System.out.println("    ↳ 目的地之后还有 " + stopsAfter.size() + " 个站，正在查询余票...");
 
-                // 优先查询终点站（买到终点概率最高），然后查中间几个大站
-                // 限制最多查 5 个站点，避免请求过多被限流
                 boolean foundOpportunity = false;
 
                 // 先查终点站
                 TrainStop lastStop = stopsAfter.get(stopsAfter.size() - 1);
-                foundOpportunity = checkExtendedTicket(fromStation, train, lastStop, date);
-                if (foundOpportunity) buyLongOpportunities++;
+                TrainInfo extResult = findExtendedTicket(fromStation, train, lastStop, date);
+                if (extResult != null) {
+                    buyLongResults.add(new BuyLongResult(train, extResult, lastStop.getStationName()));
+                    System.out.println("    ★ 买长乘短机会! "
+                            + fromStation.getName() + " → " + lastStop.getStationName()
+                            + " (" + train.getStationTrainCode() + "): "
+                            + extResult.getTicketSummary());
+                    foundOpportunity = true;
+                }
 
                 // 再查中间站（均匀取样，最多再查4个）
                 if (!foundOpportunity && stopsAfter.size() > 1) {
@@ -247,10 +272,15 @@ public class App {
                     int checked = 0;
                     for (int i = 0; i < stopsAfter.size() - 1 && checked < 4; i += step) {
                         TrainStop extStop = stopsAfter.get(i);
-                        if (checkExtendedTicket(fromStation, train, extStop, date)) {
-                            buyLongOpportunities++;
+                        extResult = findExtendedTicket(fromStation, train, extStop, date);
+                        if (extResult != null) {
+                            buyLongResults.add(new BuyLongResult(train, extResult, extStop.getStationName()));
+                            System.out.println("    ★ 买长乘短机会! "
+                                    + fromStation.getName() + " → " + extStop.getStationName()
+                                    + " (" + train.getStationTrainCode() + "): "
+                                    + extResult.getTicketSummary());
                             foundOpportunity = true;
-                            break; // 找到一个机会就够了
+                            break;
                         }
                         checked++;
                     }
@@ -265,21 +295,40 @@ public class App {
             }
         }
 
-        printSummary(directTrains.size(), hasTicketCount, noTicketCount, buyLongOpportunities);
+        // ===== 买长乘短有票汇总 =====
+        if (!buyLongResults.isEmpty()) {
+            System.out.println();
+            System.out.println("============ 买长乘短有票车次 (" + buyLongResults.size() + " 个) ============");
+            System.out.println(String.format("%-8s %-8s %-8s %-10s %-6s %-6s %-6s %s",
+                    "车次", "出发站", "目的地", "购票到站", "出发", "到达", "历时", "余票"));
+            System.out.println("-".repeat(100));
+            for (BuyLongResult r : buyLongResults) {
+                System.out.println(String.format("%-8s %-8s %-8s %-10s %-6s %-6s %-6s %s",
+                        r.originalTrain.getStationTrainCode(),
+                        r.originalTrain.getFromStationName(),
+                        r.originalTrain.getToStationName(),
+                        r.buyToStation,
+                        r.originalTrain.getStartTime(),
+                        r.originalTrain.getArriveTime(),
+                        r.originalTrain.getDuration(),
+                        r.extendedTrain.getTicketSummary()));
+            }
+        }
+
+        printSummary(directTrains.size(), hasTicketCount, noTicketCount, buyLongResults.size());
     }
 
     /**
-     * 查询延伸站点的余票
-     * @return 是否找到买长乘短机会
+     * 查询延伸站点的余票，返回有票的 TrainInfo，无票返回 null
      */
-    private boolean checkExtendedTicket(Station fromStation, TrainInfo train, TrainStop extStop, String date) {
+    private TrainInfo findExtendedTicket(Station fromStation, TrainInfo train, TrainStop extStop, String date) {
         String extCode = extStop.getStationCode();
         if (extCode == null || extCode.isEmpty()) {
             Station extStation = stationService.getByName(extStop.getStationName());
             if (extStation != null) {
                 extCode = extStation.getCode();
             } else {
-                return false;
+                return null;
             }
         }
 
@@ -289,29 +338,37 @@ public class App {
 
             for (TrainInfo extTrain : extTickets) {
                 if (extTrain.getStationTrainCode().equals(train.getStationTrainCode())) {
-                    if (extTrain.hasAvailableTicket()) {
-                        System.out.println("    ★ 买长乘短机会! "
-                                + fromStation.getName() + " → " + extStop.getStationName()
-                                + " (" + train.getStationTrainCode() + "): "
-                                + extTrain.getTicketSummary());
-                        return true;
-                    }
-                    return false;
+                    return extTrain.hasAvailableTicket() ? extTrain : null;
                 }
             }
         } catch (Exception e) {
             // 查询失败，跳过
         }
-        return false;
+        return null;
+    }
+
+    /**
+     * 买长乘短查询结果
+     */
+    private static class BuyLongResult {
+        final TrainInfo originalTrain;   // 原始车次（直达无票）
+        final TrainInfo extendedTrain;   // 延伸查询（有票）
+        final String buyToStation;       // 购票到站名
+
+        BuyLongResult(TrainInfo originalTrain, TrainInfo extendedTrain, String buyToStation) {
+            this.originalTrain = originalTrain;
+            this.extendedTrain = extendedTrain;
+            this.buyToStation = buyToStation;
+        }
     }
 
     private void printSummary(int total, int hasTicket, int noTicket, int buyLong) {
         System.out.println();
         System.out.println("========== 查询总结 ==========");
         System.out.println("车次总数: " + total);
-        System.out.println("有票车次: " + hasTicket);
-        System.out.println("无票车次: " + noTicket);
-        System.out.println("买长乘短机会: " + buyLong);
+        System.out.println("直达有票: " + hasTicket);
+        System.out.println("直达无票: " + noTicket);
+        System.out.println("买长乘短有票: " + buyLong);
         System.out.println("==============================");
     }
 

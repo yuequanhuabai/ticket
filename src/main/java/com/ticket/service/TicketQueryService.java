@@ -27,9 +27,15 @@ public class TicketQueryService {
             "queryO", "queryE", "queryD", "queryY"
     };
 
-    private String queryEndpoint = null; // 动态检测
+    private String queryEndpoint = null;
     private final StationService stationService;
     private boolean sessionInitialized = false;
+
+    /** 连续限流计数器 */
+    private int rateLimitCount = 0;
+
+    /** 总请求计数器 */
+    private int totalRequests = 0;
 
     public TicketQueryService(StationService stationService) {
         this.stationService = stationService;
@@ -58,12 +64,10 @@ public class TicketQueryService {
             System.out.println("正在检测余票查询接口...");
             String html = HttpUtil.getHtml("https://kyfw.12306.cn/otn/leftTicket/init");
 
-            // 在页面 JS 中搜索类似 var CLeftTicketUrl = 'leftTicket/queryX' 的模式
             Pattern pattern = Pattern.compile("var\\s+CLeftTicketUrl\\s*=\\s*'([^']+)'");
             Matcher matcher = pattern.matcher(html);
             if (matcher.find()) {
                 String url = matcher.group(1);
-                // url 可能是 "leftTicket/queryZ" 或直接是 "queryZ"
                 if (url.contains("/")) {
                     queryEndpoint = url.substring(url.lastIndexOf("/") + 1);
                 } else {
@@ -76,19 +80,34 @@ public class TicketQueryService {
             System.err.println("检测接口失败: " + e.getMessage());
         }
 
-        // 如果检测失败，使用默认值
         queryEndpoint = "query";
         System.out.println("使用默认查询接口: " + queryEndpoint);
+    }
+
+    /**
+     * 重新初始化会话（被限流后调用）
+     */
+    private void refreshSession() {
+        try {
+            System.out.println("    [刷新会话中...]");
+            HttpUtil.initSession();
+            sessionInitialized = true;
+            detectEndpoint();
+            rateLimitCount = 0;
+        } catch (Exception e) {
+            // 刷新失败，继续用旧的
+        }
     }
 
     /**
      * 查询两站之间的余票
      */
     public List<TrainInfo> queryTickets(String fromStationCode, String toStationCode, String date) throws IOException {
-        // 确保已初始化
         if (!sessionInitialized) {
             init();
         }
+
+        totalRequests++;
 
         String url = BASE_URL + queryEndpoint
                 + "?leftTicketDTO.train_date=" + date
@@ -96,24 +115,32 @@ public class TicketQueryService {
                 + "&leftTicketDTO.to_station=" + toStationCode
                 + "&purpose_codes=ADULT";
 
-        String response = HttpUtil.get(url);
+        String response;
+        try {
+            response = HttpUtil.get(url);
+        } catch (IOException e) {
+            // 网络错误，可能是限流导致连接被拒
+            return handleRateLimit(fromStationCode, toStationCode, date);
+        }
 
-        // 检查是否返回了非 JSON 内容（如 HTML 错误页面）
         String trimmed = response.trim();
+
+        // 空响应
         if (trimmed.isEmpty()) {
-            System.err.println("API 返回空响应");
-            return new ArrayList<>();
+            return handleRateLimit(fromStationCode, toStationCode, date);
         }
 
+        // 非 JSON 响应 → 大概率是被限流了（返回了 HTML 页面）
         if (!trimmed.startsWith("{")) {
-            // 不是 JSON，可能 endpoint 已变更，尝试其他 endpoint
-            System.err.println("当前接口(" + queryEndpoint + ")返回非JSON响应，正在尝试其他接口...");
-            return retryWithOtherEndpoints(fromStationCode, toStationCode, date);
+            return handleRateLimit(fromStationCode, toStationCode, date);
         }
+
+        // 成功拿到 JSON，重置限流计数
+        rateLimitCount = 0;
 
         List<TrainInfo> result = parseResponse(response);
 
-        // 如果解析结果为空且 response 包含 c_url，说明 endpoint 需要更新
+        // 检查是否需要更新 endpoint（c_url）
         if (result.isEmpty() && response.contains("c_url")) {
             try {
                 JsonObject root = JsonParser.parseString(response).getAsJsonObject();
@@ -125,7 +152,7 @@ public class TicketQueryService {
                         } else {
                             queryEndpoint = newUrl;
                         }
-                        System.out.println("接口已更新为: " + queryEndpoint + "，正在重新查询...");
+                        System.out.println("    [接口已更新: " + queryEndpoint + "]");
                         return queryTickets(fromStationCode, toStationCode, date);
                     }
                 }
@@ -136,42 +163,64 @@ public class TicketQueryService {
     }
 
     /**
-     * 依次尝试已知的 endpoint 后缀
+     * 处理限流：等待后重试，而不是盲目切换 endpoint
      */
-    private List<TrainInfo> retryWithOtherEndpoints(String fromStationCode, String toStationCode, String date) {
-        for (String endpoint : KNOWN_ENDPOINTS) {
-            if (endpoint.equals(queryEndpoint)) continue; // 跳过已失败的
+    private List<TrainInfo> handleRateLimit(String fromStationCode, String toStationCode, String date) {
+        rateLimitCount++;
 
+        if (rateLimitCount <= 3) {
+            // 前3次：递增等待后重试同一 endpoint
+            long waitSeconds = rateLimitCount * 3L; // 3秒, 6秒, 9秒
+            System.out.println("    [被限流，等待" + waitSeconds + "秒后重试...]");
             try {
-                String url = BASE_URL + endpoint
+                Thread.sleep(waitSeconds * 1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+
+            // 重试
+            try {
+                String url = BASE_URL + queryEndpoint
                         + "?leftTicketDTO.train_date=" + date
                         + "&leftTicketDTO.from_station=" + fromStationCode
                         + "&leftTicketDTO.to_station=" + toStationCode
                         + "&purpose_codes=ADULT";
-
                 String response = HttpUtil.get(url);
                 String trimmed = response.trim();
-
                 if (!trimmed.isEmpty() && trimmed.startsWith("{")) {
-                    List<TrainInfo> result = parseResponse(response);
-                    if (!result.isEmpty()) {
-                        queryEndpoint = endpoint;
-                        System.out.println("找到有效接口: " + endpoint);
-                        return result;
-                    }
-                    // 即使结果为空但 JSON 格式正确，也记住这个 endpoint
-                    if (trimmed.contains("\"data\"")) {
-                        queryEndpoint = endpoint;
-                        System.out.println("找到有效接口: " + endpoint + "（当前无车次数据）");
-                        return result;
-                    }
+                    rateLimitCount = 0;
+                    return parseResponse(response);
                 }
             } catch (Exception e) {
-                // 继续尝试下一个
+                // 重试也失败了
+            }
+
+            // 重试失败，递归继续
+            return handleRateLimit(fromStationCode, toStationCode, date);
+        }
+
+        if (rateLimitCount == 4) {
+            // 第4次：刷新会话后重试
+            refreshSession();
+            try {
+                String url = BASE_URL + queryEndpoint
+                        + "?leftTicketDTO.train_date=" + date
+                        + "&leftTicketDTO.from_station=" + fromStationCode
+                        + "&leftTicketDTO.to_station=" + toStationCode
+                        + "&purpose_codes=ADULT";
+                String response = HttpUtil.get(url);
+                String trimmed = response.trim();
+                if (!trimmed.isEmpty() && trimmed.startsWith("{")) {
+                    rateLimitCount = 0;
+                    return parseResponse(response);
+                }
+            } catch (Exception e) {
+                // 刷新后重试也失败
             }
         }
 
-        System.err.println("所有已知接口均无法获取数据，12306 可能已更新接口。");
+        // 超过重试次数，放弃本次查询
+        rateLimitCount = 0;
         return new ArrayList<>();
     }
 
@@ -184,7 +233,6 @@ public class TicketQueryService {
         try {
             JsonObject root = JsonParser.parseString(response).getAsJsonObject();
 
-            // 检查是否有错误信息
             if (root.has("status") && !root.get("status").getAsBoolean()) {
                 if (root.has("messages") && root.getAsJsonArray("messages").size() > 0) {
                     System.err.println("12306 返回错误: " + root.getAsJsonArray("messages"));
@@ -192,19 +240,13 @@ public class TicketQueryService {
                 return trains;
             }
 
-            if (!root.has("data")) {
-                return trains;
-            }
+            if (!root.has("data")) return trains;
 
             JsonElement dataElement = root.get("data");
-            if (!dataElement.isJsonObject()) {
-                return trains;
-            }
+            if (!dataElement.isJsonObject()) return trains;
 
             JsonObject data = dataElement.getAsJsonObject();
-            if (!data.has("result")) {
-                return trains;
-            }
+            if (!data.has("result")) return trains;
 
             JsonObject stationMap = data.has("map") ? data.getAsJsonObject("map") : null;
 
@@ -218,7 +260,6 @@ public class TicketQueryService {
             }
         } catch (Exception e) {
             System.err.println("解析余票数据失败: " + e.getMessage());
-            // 打印前200个字符帮助调试
             if (response.length() > 200) {
                 System.err.println("响应内容(前200字符): " + response.substring(0, 200));
             } else {
@@ -260,7 +301,6 @@ public class TicketQueryService {
             train.setStartStationCode(fields[4]);
             train.setEndStationCode(fields[5]);
 
-            // 从 stationService 解析始发站/终到站名称
             Station startStation = stationService.getByCode(fields[4]);
             train.setStartStationName(startStation != null ? startStation.getName() : fields[4]);
             Station endStation = stationService.getByCode(fields[5]);
