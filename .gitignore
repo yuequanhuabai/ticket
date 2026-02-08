@@ -1,0 +1,17 @@
+target/
+*.class
+*.jar
+*.log
+stations.dat
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+*.swp
+
+# Claude
+.claude/
